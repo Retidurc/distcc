@@ -182,7 +182,7 @@ static int dcc_lock_one(struct dcc_hostdef *hostlist,
 
                 i_cpu_is_usable = 1;
 
-                ret = dcc_lock_host("cpu", h, i_cpu, 0, cpu_lock_fd);
+
 
                 if (ret == 0) {
                     *buildhost = h;
