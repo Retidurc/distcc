@@ -580,44 +580,119 @@ int dcc_remove_if_exists(const char *fname)
     return 0;
 }
 
+/*
+ * Returns the absolute path of *command by searching each subpath of PATH.
+ *
+ * Input *command is either "c++" or "cc".
+ * **out points to a newly allocated buffer holding the absolute path,
+ * such as "/usr/bin/cc".
+ *
+ * Skip any path compenents that include the substring "distcc" to avoid loops.
+ */
 int dcc_which(const char *command, char **out)
 {
-    char *loc = NULL, *_loc, *path, *t;
-    int ret;
-
-    path = getenv("PATH");
-    if (!path)
-        return -ENOENT;
-    do {
-        if (strstr(path, "distcc"))
-            continue;
-        /* emulate strchrnul() */
-        t = strchr(path, ':');
-        if (!t)
-            t = path + strlen(path);
-        _loc = realloc(loc, t - path + 1 + strlen(command) + 1);
+    char *loc = NULL, *_loc = NULL, *path, *next_colon;
+    size_t dir_len;
+    char *next_path = getenv("PATH");
+    while (1) {
+        path = next_path;
+        if (!path) {
+            free(loc);
+            return -ENOENT;
+        }
+        next_colon = strchr(path, ':');
+        if (!next_colon) {
+            next_path = NULL;
+            dir_len = strlen(path);
+        } else {
+            next_path = next_colon + 1;
+            dir_len = next_colon - path;
+        }
+        _loc = realloc(loc, dir_len + strlen(command) + 2);
         if (!_loc) {
             free(loc);
             return -ENOMEM;
         }
         loc = _loc;
-        strncpy(loc, path, t - path);
-        loc[t - path] = '\0';
+        strncpy(loc, path, dir_len);
+        loc[dir_len] = '\0';
+        if (strstr(loc, "distcc"))
+            continue;
         strcat(loc, "/");
         strcat(loc, command);
-        ret = access(loc, X_OK);
-        if (ret < 0)
-            continue;
-        *out = loc;
-        return 0;
-    } while ((path = strchr(path, ':') + 1));
-    return -ENOENT;
+        if (access(loc, X_OK) == 0) {
+            *out = loc;
+            return 0;
+        }
+    }
 }
 
-/* Returns the number of processes in state D, the max non-cc/c++ RSS in kb and
- * the max RSS program's name */
-void dcc_get_proc_stats(int *num_D, int *max_RSS, char **max_RSS_name) {
-#if defined(linux)
+#ifdef linux
+/* Returns the value from the "MemAvailable" line in the opened file stream,
+ * that is expected to have the /proc/meminfo (proc(5)) format, converted to MB
+ * (or -1 if the information is not available).
+ * The file is closed by this function! */
+static int dcc_get_proc_meminfo_mem_available(FILE* f) {
+    int mem_available = -1;
+    char line[512];
+
+    char key[128];
+    long value;
+    char unit[4];
+    char magnitude;
+
+    if (f == NULL)
+        return -1;
+
+    while (fgets(line, sizeof(line), f) != NULL) {
+        if (sscanf(line, "%127s %ld %4s", key, &value, unit) != 3)
+            continue;
+        if (strncmp(key, "MemAvailable:", sizeof("MemAvailable:")) == 0)
+            break;
+    }
+
+    if (feof(f) || ferror(f)) {
+        fclose(f);
+        return -1;
+    }
+    fclose(f);
+
+    mem_available = value;
+    magnitude = unit[0];
+
+    switch (magnitude) {
+        case 'T':
+            mem_available *= 1024;
+            /* fallthrough */
+        case 'G':
+            mem_available *= 1024;
+            /* fallthrough */
+        case 'M':
+            break;
+        case 'K':
+        case 'k':
+            mem_available /= 1024;
+            break;
+        default:
+            rs_log_warning("/proc/meminfo: 'MemAvailable' is \"%d %.4s\", "
+                           "unhandled unit '%c'!",
+                           mem_available, unit, magnitude);
+            mem_available = -1;
+            break;
+    }
+
+    return mem_available;
+}
+#endif
+
+/* Returns the number of processes in state D, the max non-cc/c++ RSS in kB,
+ * the max RSS program's name, and the amount of available memory reported
+ * by the kernel (in MB, or -1, if unknown). */
+void dcc_get_proc_stats(int *num_D,
+                        int *mem_available,
+                        int *max_RSS,
+                        char **max_RSS_name) {
+#ifdef linux
     DIR *proc = opendir("/proc");
     struct dirent *procsubdir;
     static int pagesize = -1;
@@ -647,6 +722,12 @@ void dcc_get_proc_stats(int *num_D, int *max_RSS, char **max_RSS_name) {
     *max_RSS_name = RSS_name;
     RSS_name[0] = 0;
 
+    f = fopen("/proc/meminfo", "r");
+    if (f != NULL)
+        *mem_available = dcc_get_proc_meminfo_mem_available(f);
+    else
+        *mem_available = -1;
+
     while ((procsubdir = readdir(proc)) != NULL) {
         if (sscanf(procsubdir->d_name, "%d", &pid) != 1)
             continue;
@@ -659,7 +740,7 @@ void dcc_get_proc_stats(int *num_D, int *max_RSS, char **max_RSS_name) {
         if (f == NULL)
             continue;
 
-        if (fscanf(f, "%*d %s %c %*d %*d %*d %*d %*d %*d %*d %*d %*d %*d %*d %*d %*d %*d %*d %*d %*d %*d %*d %*d %d",
+        if (fscanf(f, "%*d %1023s %c %*d %*d %*d %*d %*d %*d %*d %*d %*d %*d %*d %*d %*d %*d %*d %*d %*d %*d %*d %*d %d",
                         name, &state, &rss_size) != 3) {
             fclose(f);
             continue;
@@ -689,6 +770,7 @@ void dcc_get_proc_stats(int *num_D, int *max_RSS, char **max_RSS_name) {
 #else
     static char RSS_name[] = "none";
     *num_D = -1;
+    *mem_available = -1;
     *max_RSS = -1;
     *max_RSS_name = RSS_name;
 #endif
